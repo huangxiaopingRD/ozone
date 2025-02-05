@@ -1369,9 +1369,8 @@
       specified when writing the key. The default is used if replication
       is not specified when creating key or no default replication set at
       bucket. Supported values:
-      For Standalone: 1
-      For Ratis: 3
-      For Erasure Coding(EC) supported format:
+      For RATIS: 1, 3
+      For EC (Erasure Coding) supported format:
       {ECCodec}-{DataBlocks}-{ParityBlocks}-{ChunkSize}
         ECCodec: Codec for encoding stripe. Supported values : XOR, RS (Reed Solomon)
         DataBlocks: Number of data blocks in a stripe.
@@ -1389,7 +1388,7 @@
       Default replication type to be used while writing key into ozone. The
       value can be specified when writing the key, default is used when
       nothing is specified when creating key or no default value set at bucket.
-      Supported values: RATIS, STAND_ALONE, CHAINED and EC.
+      Supported values: RATIS, EC.
     </description>
   </property>
 
@@ -1889,6 +1888,48 @@
     <description>The actual address the HTTPS server will bind to. If this optional address
       is set, it overrides only the hostname portion of ozone.s3g.https-address.
       This is useful for making the Ozone S3Gateway HTTPS server listen on all
+      interfaces by setting it to 0.0.0.0.</description>
+  </property>
+
+  <property>
+    <name>ozone.s3g.webadmin.http.enabled</name>
+    <value>true</value>
+    <tag>OZONE, S3GATEWAY</tag>
+    <description>This option can be used to disable the web server which serves additional content in Ozone S3 Gateway.</description>
+  </property>
+
+  <property>
+    <name>ozone.s3g.webadmin.https-address</name>
+    <value/>
+    <tag>OZONE, S3GATEWAY</tag>
+    <description>Ozone S3Gateway content server's HTTPS address and port.</description>
+  </property>
+
+  <property>
+    <name>ozone.s3g.webadmin.https-bind-host</name>
+    <value/>
+    <tag>OZONE, S3GATEWAY</tag>
+    <description>The actual address the HTTPS server will bind to. If this optional address
+      is set, it overrides only the hostname portion of ozone.s3g.webadmin.https-address.
+      This is useful for making the Ozone S3Gateway HTTPS server listen on all
+      interfaces by setting it to 0.0.0.0.</description>
+  </property>
+
+  <property>
+    <name>ozone.s3g.webadmin.http-address</name>
+    <value>0.0.0.0:19878</value>
+    <tag>OZONE, S3GATEWAY</tag>
+    <description>The address and port where Ozone S3Gateway serves
+      web content.</description>
+  </property>
+
+  <property>
+    <name>ozone.s3g.webadmin.http-bind-host</name>
+    <value>0.0.0.0</value>
+    <tag>OZONE, S3GATEWAY</tag>
+    <description>The actual address the HTTP server will bind to. If this optional address
+      is set, it overrides only the hostname portion of ozone.s3g.webadmin.http-address.
+      This is useful for making the Ozone S3Gateway HTTP server listen on all
       interfaces by setting it to 0.0.0.0.</description>
   </property>
 
@@ -3643,14 +3684,6 @@
       orphan directory it deletes the sub-path tree structure(dirs/files). It
       sends sub-files to KeyDeletingService to deletes its blocks. Unit could
       be defined with postfix (ns,ms,s,m,h,d)
-    </description>
-  </property>
-  <property>
-    <name>ozone.path.deleting.limit.per.task</name>
-    <value>6000</value>
-    <tag>OZONE, PERFORMANCE, OM</tag>
-    <description>A maximum number of paths(dirs/files) to be deleted by
-      directory deleting service per time interval.
     </description>
   </property>
   <property>
