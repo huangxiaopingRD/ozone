@@ -1,22 +1,38 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- * <p>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p>
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.hadoop.hdds.scm.container.replication;
 
+import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState.IN_SERVICE;
+import static org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ContainerReplicaProto.State.CLOSED;
+import static org.apache.hadoop.hdds.scm.exceptions.SCMException.ResultCodes.FAILED_TO_FIND_SUITABLE_NODE;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyBoolean;
+import static org.mockito.Mockito.anyInt;
+import static org.mockito.Mockito.anyList;
+import static org.mockito.Mockito.doAnswer;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
@@ -41,23 +57,6 @@ import org.apache.hadoop.ozone.protocol.commands.ReplicateContainerCommand;
 import org.apache.hadoop.ozone.protocol.commands.SCMCommand;
 import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.mockito.stubbing.Answer;
-
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
-
-import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState.IN_SERVICE;
-import static org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ContainerReplicaProto.State.CLOSED;
-import static org.apache.hadoop.hdds.scm.exceptions.SCMException.ResultCodes.FAILED_TO_FIND_SUITABLE_NODE;
-import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.anyInt;
-import static org.mockito.Mockito.anyList;
-import static org.mockito.Mockito.anyBoolean;
-import static org.mockito.Mockito.doAnswer;
 
 /**
  * Helper class to provide common methods used to test ReplicationManager.
@@ -88,6 +87,16 @@ public final class ReplicationTestUtil {
   public static Set<ContainerReplica> createReplicas(ContainerID containerID,
       int... indexes) {
     return createReplicas(containerID, CLOSED, indexes);
+  }
+
+  public static Set<ContainerReplica> createEmptyReplicas(ContainerID containerID,
+      ContainerReplicaProto.State replicaState, int... indexes) {
+    Set<ContainerReplica> replicas = new HashSet<>();
+    for (int i : indexes) {
+      replicas.add(createEmptyContainerReplica(
+          containerID, i, IN_SERVICE, replicaState));
+    }
+    return replicas;
   }
 
   public static Set<ContainerReplica> createReplicas(ContainerID containerID,
@@ -122,6 +131,27 @@ public final class ReplicationTestUtil {
       replicas.add(createContainerReplica(
           containerID, i, IN_SERVICE, replicaState, 123L, 1234L,
           MockDatanodeDetails.randomDatanodeDetails(), originNodeId));
+    }
+    return replicas;
+  }
+  public static ContainerReplica createEmptyContainerReplica(ContainerID containerID,
+      int replicaIndex, HddsProtos.NodeOperationalState opState,
+      ContainerReplicaProto.State replicaState) {
+    DatanodeDetails datanodeDetails
+        = MockDatanodeDetails.randomDatanodeDetails();
+    return createContainerReplica(containerID, replicaIndex, opState,
+        replicaState, 0L, 0L,
+        datanodeDetails, datanodeDetails.getUuid());
+  }
+
+  public static Set<ContainerReplica> createReplicasWithOriginAndOpState(
+      ContainerID containerID, ContainerReplicaProto.State replicaState,
+      Pair<UUID, HddsProtos.NodeOperationalState>... nodes) {
+    Set<ContainerReplica> replicas = new HashSet<>();
+    for (Pair<UUID, HddsProtos.NodeOperationalState> i : nodes) {
+      replicas.add(createContainerReplica(
+          containerID, 0, i.getRight(), replicaState, 123L, 1234L,
+          MockDatanodeDetails.randomDatanodeDetails(), i.getLeft()));
     }
     return replicas;
   }
@@ -474,9 +504,29 @@ public final class ReplicationTestUtil {
    * @param commandsSent Set to add the command to rather than sending it.
    */
   public static void mockRMSendThrottledDeleteCommand(ReplicationManager mock,
-      Set<Pair<DatanodeDetails, SCMCommand<?>>> commandsSent)
+                                                      Set<Pair<DatanodeDetails, SCMCommand<?>>> commandsSent)
+      throws NotLeaderException, CommandTargetOverloadedException {
+    mockRMSendThrottledDeleteCommand(mock, commandsSent, new AtomicBoolean(false));
+  }
+
+  /**
+   * Given a Mockito mock of ReplicationManager, this method will mock the
+   * sendThrottledDeleteCommand method so that it adds the command created to
+   * the commandsSent set.
+   * @param mock Mock of ReplicationManager
+   * @param commandsSent Set to add the command to rather than sending it.
+   * @param throwOverloaded If the atomic boolean is true, throw a
+   *                        CommandTargetOverloadedException and set the boolean
+   *                        to false, instead of creating the replicate command.
+   */
+  public static void mockRMSendThrottledDeleteCommand(ReplicationManager mock,
+      Set<Pair<DatanodeDetails, SCMCommand<?>>> commandsSent, AtomicBoolean throwOverloaded)
       throws NotLeaderException, CommandTargetOverloadedException {
     doAnswer((Answer<Void>) invocationOnMock -> {
+      if (throwOverloaded.get()) {
+        throwOverloaded.set(false);
+        throw new CommandTargetOverloadedException("Overloaded");
+      }
       ContainerInfo containerInfo = invocationOnMock.getArgument(0);
       int replicaIndex = invocationOnMock.getArgument(1);
       DatanodeDetails target = invocationOnMock.getArgument(2);
