@@ -66,6 +66,8 @@ import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_SNAPSHOT_SST_FILTERI
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_SNAPSHOT_SST_FILTERING_SERVICE_INTERVAL_DEFAULT;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_THREAD_NUMBER_DIR_DELETION;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_THREAD_NUMBER_DIR_DELETION_DEFAULT;
+import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_THREAD_NUMBER_KEY_DELETION;
+import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_THREAD_NUMBER_KEY_DELETION_DEFAULT;
 import static org.apache.hadoop.ozone.om.OzoneManagerUtils.getBucketLayout;
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.BUCKET_NOT_FOUND;
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.FILE_NOT_FOUND;
@@ -74,7 +76,7 @@ import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.INVA
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.KEY_NOT_FOUND;
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.SCM_GET_PIPELINE_EXCEPTION;
 import static org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes.VOLUME_NOT_FOUND;
-import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.Resource.BUCKET_LOCK;
+import static org.apache.hadoop.ozone.om.lock.OzoneManagerLock.LeveledResource.BUCKET_LOCK;
 import static org.apache.hadoop.ozone.security.acl.OzoneObj.ResourceType.KEY;
 import static org.apache.hadoop.ozone.util.MetricUtil.captureLatencyNs;
 import static org.apache.hadoop.util.Time.monotonicNow;
@@ -113,6 +115,7 @@ import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
 import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.EncryptedKeyVersion;
 import org.apache.hadoop.fs.FileEncryptionInfo;
 import org.apache.hadoop.hdds.HddsConfigKeys;
+import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
@@ -136,6 +139,7 @@ import org.apache.hadoop.net.DNSToSwitchMapping;
 import org.apache.hadoop.net.TableMapping;
 import org.apache.hadoop.ozone.OmUtils;
 import org.apache.hadoop.ozone.OzoneAcl;
+import org.apache.hadoop.ozone.common.BlockGroup;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.exceptions.OMException.ResultCodes;
 import org.apache.hadoop.ozone.om.helpers.BucketEncryptionKeyInfo;
@@ -172,6 +176,7 @@ import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
 import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.apache.hadoop.ozone.security.acl.RequestContext;
 import org.apache.hadoop.security.SecurityUtil;
+import org.apache.hadoop.util.Lists;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.ratis.util.function.CheckedFunction;
@@ -254,9 +259,15 @@ public class KeyManagerImpl implements KeyManager {
           OZONE_BLOCK_DELETING_SERVICE_TIMEOUT,
           OZONE_BLOCK_DELETING_SERVICE_TIMEOUT_DEFAULT,
           TimeUnit.MILLISECONDS);
+      int keyDeletingServiceCorePoolSize =
+          configuration.getInt(OZONE_THREAD_NUMBER_KEY_DELETION,
+              OZONE_THREAD_NUMBER_KEY_DELETION_DEFAULT);
+      if (keyDeletingServiceCorePoolSize <= 0) {
+        keyDeletingServiceCorePoolSize = 1;
+      }
       keyDeletingService = new KeyDeletingService(ozoneManager,
-          scmClient.getBlockClient(), this, blockDeleteInterval,
-          serviceTimeout, configuration, isSnapshotDeepCleaningEnabled);
+          scmClient.getBlockClient(), blockDeleteInterval,
+          serviceTimeout, configuration, keyDeletingServiceCorePoolSize, isSnapshotDeepCleaningEnabled);
       keyDeletingService.start();
     }
 
@@ -722,12 +733,66 @@ public class KeyManagerImpl implements KeyManager {
   }
 
   @Override
-  public PendingKeysDeletion getPendingDeletionKeys(final int count)
+  public PendingKeysDeletion getPendingDeletionKeys(
+      final CheckedFunction<Table.KeyValue<String, OmKeyInfo>, Boolean, IOException> filter, final int count)
       throws IOException {
-    OmMetadataManagerImpl omMetadataManager =
-        (OmMetadataManagerImpl) metadataManager;
-    return omMetadataManager
-        .getPendingDeletionKeys(count, ozoneManager.getOmSnapshotManager());
+    return getPendingDeletionKeys(null, null, null, filter, count);
+  }
+
+  @Override
+  public PendingKeysDeletion getPendingDeletionKeys(
+      String volume, String bucket, String startKey,
+      CheckedFunction<Table.KeyValue<String, OmKeyInfo>, Boolean, IOException> filter,
+      int count) throws IOException {
+    List<BlockGroup> keyBlocksList = Lists.newArrayList();
+    Map<String, RepeatedOmKeyInfo> keysToModify = new HashMap<>();
+    // Bucket prefix would be empty if volume is empty i.e. either null or "".
+    Optional<String> bucketPrefix = getBucketPrefix(volume, bucket, false);
+    try (TableIterator<String, ? extends Table.KeyValue<String, RepeatedOmKeyInfo>>
+             delKeyIter = metadataManager.getDeletedTable().iterator(bucketPrefix.orElse(""))) {
+
+      /* Seeking to the start key if it not null. The next key picked up would be ensured to start with the bucket
+         prefix, {@link org.apache.hadoop.hdds.utils.db.Table#iterator(bucketPrefix)} would ensure this.
+       */
+      if (startKey != null) {
+        delKeyIter.seek(startKey);
+      }
+      int currentCount = 0;
+      while (delKeyIter.hasNext() && currentCount < count) {
+        RepeatedOmKeyInfo notReclaimableKeyInfo = new RepeatedOmKeyInfo();
+        Table.KeyValue<String, RepeatedOmKeyInfo> kv = delKeyIter.next();
+        if (kv != null) {
+          List<BlockGroup> blockGroupList = Lists.newArrayList();
+          // Multiple keys with the same path can be queued in one DB entry
+          RepeatedOmKeyInfo infoList = kv.getValue();
+          for (OmKeyInfo info : infoList.getOmKeyInfoList()) {
+
+            // Skip the key if the filter doesn't allow the file to be deleted.
+            if (filter == null || filter.apply(Table.newKeyValue(kv.getKey(), info))) {
+              List<BlockID> blockIDS = info.getKeyLocationVersions().stream()
+                  .flatMap(versionLocations -> versionLocations.getLocationList().stream()
+                      .map(b -> new BlockID(b.getContainerID(), b.getLocalID()))).collect(Collectors.toList());
+              BlockGroup keyBlocks = BlockGroup.newBuilder().setKeyName(kv.getKey())
+                  .addAllBlockIDs(blockIDS).build();
+              blockGroupList.add(keyBlocks);
+              currentCount++;
+            } else {
+              notReclaimableKeyInfo.addOmKeyInfo(info);
+            }
+          }
+
+          List<OmKeyInfo> notReclaimableKeyInfoList = notReclaimableKeyInfo.getOmKeyInfoList();
+
+          // If all the versions are not reclaimable, then modify key by just purging the key that can be purged.
+          if (!notReclaimableKeyInfoList.isEmpty() &&
+              notReclaimableKeyInfoList.size() != infoList.getOmKeyInfoList().size()) {
+            keysToModify.put(kv.getKey(), notReclaimableKeyInfo);
+          }
+          keyBlocksList.addAll(blockGroupList);
+        }
+      }
+    }
+    return new PendingKeysDeletion(keyBlocksList, keysToModify);
   }
 
   private <V, R> List<Table.KeyValue<String, R>> getTableEntries(String startKey,
@@ -1833,7 +1898,7 @@ public class KeyManagerImpl implements KeyManager {
     refreshPipelineFromCache(keyInfoList);
 
     if (args.getSortDatanodes()) {
-      sortDatanodes(clientAddress, keyInfoList.toArray(new OmKeyInfo[0]));
+      sortDatanodes(clientAddress, keyInfoList);
     }
     return fileStatusList;
   }
@@ -1962,7 +2027,7 @@ public class KeyManagerImpl implements KeyManager {
     refreshPipelineFromCache(keyInfoList);
 
     if (omKeyArgs.getSortDatanodes()) {
-      sortDatanodes(clientAddress, keyInfoList.toArray(new OmKeyInfo[0]));
+      sortDatanodes(clientAddress, keyInfoList);
     }
 
     return fileStatusFinalList;
@@ -2001,9 +2066,13 @@ public class KeyManagerImpl implements KeyManager {
     return encInfo;
   }
 
-  private void sortDatanodes(String clientMachine, OmKeyInfo... keyInfos) {
+  private void sortDatanodes(String clientMachine, OmKeyInfo keyInfo) {
+    sortDatanodes(clientMachine, Collections.singletonList(keyInfo));
+  }
+
+  private void sortDatanodes(String clientMachine, List<OmKeyInfo> keyInfos) {
     if (keyInfos != null && clientMachine != null) {
-      Map<Set<String>, List<DatanodeDetails>> sortedPipelines = new HashMap<>();
+      final Map<Set<String>, List<? extends DatanodeDetails>> sortedPipelines = new HashMap<>();
       for (OmKeyInfo keyInfo : keyInfos) {
         OmKeyLocationInfoGroup key = keyInfo.getLatestVersionLocations();
         if (key == null) {
@@ -2013,14 +2082,16 @@ public class KeyManagerImpl implements KeyManager {
         for (OmKeyLocationInfo k : key.getLocationList()) {
           Pipeline pipeline = k.getPipeline();
           List<DatanodeDetails> nodes = pipeline.getNodes();
-          List<String> uuidList = toNodeUuid(nodes);
-          Set<String> uuidSet = new HashSet<>(uuidList);
-          List<DatanodeDetails> sortedNodes = sortedPipelines.get(uuidSet);
+          if (nodes.isEmpty()) {
+            LOG.warn("No datanodes in pipeline {}", pipeline.getId());
+            continue;
+          }
+
+          final Set<String> uuidSet = nodes.stream().map(DatanodeDetails::getUuidString)
+              .collect(Collectors.toSet());
+
+          List<? extends DatanodeDetails> sortedNodes = sortedPipelines.get(uuidSet);
           if (sortedNodes == null) {
-            if (nodes.isEmpty()) {
-              LOG.warn("No datanodes in pipeline {}", pipeline.getId());
-              continue;
-            }
             sortedNodes = sortDatanodes(nodes, clientMachine);
             if (sortedNodes != null) {
               sortedPipelines.put(uuidSet, sortedNodes);
@@ -2038,7 +2109,7 @@ public class KeyManagerImpl implements KeyManager {
   }
 
   @VisibleForTesting
-  public List<DatanodeDetails> sortDatanodes(List<DatanodeDetails> nodes,
+  public List<? extends DatanodeDetails> sortDatanodes(List<? extends DatanodeDetails> nodes,
                                              String clientMachine) {
     final Node client = getClientNode(clientMachine, nodes);
     return ozoneManager.getClusterMap()
@@ -2046,7 +2117,7 @@ public class KeyManagerImpl implements KeyManager {
   }
 
   private Node getClientNode(String clientMachine,
-                             List<DatanodeDetails> nodes) {
+                             List<? extends DatanodeDetails> nodes) {
     List<DatanodeDetails> matchingNodes = new ArrayList<>();
     boolean useHostname = ozoneManager.getConfiguration().getBoolean(
         HddsConfigKeys.HDDS_DATANODE_USE_DN_HOSTNAME,
@@ -2090,14 +2161,6 @@ public class KeyManagerImpl implements KeyManager {
       LOG.debug("Node resolution did not yield any result for {}", hostname);
       return null;
     }
-  }
-
-  private static List<String> toNodeUuid(Collection<DatanodeDetails> nodes) {
-    List<String> nodeSet = new ArrayList<>(nodes.size());
-    for (DatanodeDetails node : nodes) {
-      nodeSet.add(node.getUuidString());
-    }
-    return nodeSet;
   }
 
   private void slimLocationVersion(OmKeyInfo... keyInfos) {
